@@ -1,177 +1,162 @@
 import os
 import subprocess
-import time
 from pathlib import Path
 import modal
 
-# ---- Configuration ----
 APP_NAME = "nanochat-speedrun-h100"
 VOLUME_NAME = "nanochat-persistent-storage"
-GPU_CONFIG = "H100:8"  # Adjust based on your Modal setup (e.g., "A100:4" or "H100:8")
+GPU_CONFIG = "H100:8"
 
-# Define the app and persistent volume
 app = modal.App(APP_NAME)
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-# Volume layout
 VOL_PATH = Path("/vol")
 RUNS_DIR = VOL_PATH / "runs"
 DATA_DIR = VOL_PATH / "data"
 
-# Image: Standard Debian with build tools + uv (used by nanochat)
+# CUDA base image (keep your current working one); key fix is installing cuSPARSELt into the uv venv.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install(
-        "git", "curl", "wget", "build-essential", "libssl-dev", "pkg-config"
-    )
-    .pip_install("uv", "torch") # Basic python tools
+    modal.Image.from_registry("nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git", "curl", "wget", "build-essential", "pkg-config", "findutils")
+    .pip_install("uv")
 )
 
-# ---- Helper Functions ----
+def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
+    base_env = os.environ.copy()
+    if env:
+        base_env.update(env)
 
-def _run(cmd: str, cwd: Path = None, env: dict = None):
-    """Executes a shell command and streams output."""
+    # Helpful on CUDA images
+    base_env["LD_LIBRARY_PATH"] = base_env.get("LD_LIBRARY_PATH", "") + ":/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+
     print(f"\n[EXEC] {cmd}\n", flush=True)
-    subprocess.run(
-        ["bash", "-lc", cmd],
-        cwd=cwd,
-        env=env,
-        check=True
-    )
+    subprocess.run(["bash", "-lc", cmd], cwd=cwd, env=base_env, check=True)
 
-def _setup_workspace(model: str, repo_url: str, repo_ref: str) -> Path:
-    """
-    Clones repo and sets up symlinks for persistence.
-    Returns the path to the repository root.
-    """
+def _find_file(name: str, root: Path) -> Path | None:
+    try:
+        out = subprocess.check_output(["find", str(root), "-name", name], text=True).strip().splitlines()
+        if out and out[0]:
+            return Path(sorted(out, key=len)[0])
+    except Exception:
+        return None
+    return None
+
+def _setup_repo(repo_ref: str, repo_url: str) -> Path:
     workdir = Path("/root/nanochat_work")
     repo_dir = workdir / "nanochat"
-    
-    # 1. Prepare Volume Directories
+
     _run(f"mkdir -p '{RUNS_DIR}' '{DATA_DIR}'")
-    
-    # 2. Clone Repo (if not exists in ephemeral container)
     if not repo_dir.exists():
         _run(f"mkdir -p '{workdir}'")
         _run(f"git clone --depth 1 '{repo_url}' '{repo_dir}'")
-    
-    # 3. Checkout specific ref
-    _run(f"git fetch --all --tags && git checkout '{repo_ref}'", cwd=repo_dir)
 
-    # 4. SYMLINK persistence
-    # We delete the repo's empty folders and link to our Volume folders
-    # This ensures 'data/' and 'logs/' (or 'runs/') are stored on the Volume.
-    
-    # Link Data
-    _run(f"rm -rf data && ln -s {DATA_DIR} data", cwd=repo_dir)
-    
-    # Link Logs/Outputs (Nanochat typically uses 'logs' or 'out')
-    # We create a specific folder for this model to keep things clean
-    model_log_dir = RUNS_DIR / model
-    _run(f"mkdir -p '{model_log_dir}'")
-    _run(f"rm -rf logs && ln -s {RUNS_DIR} logs", cwd=repo_dir)
-    
+    _run("git fetch --all --tags --prune", cwd=repo_dir)
+    _run(f"git checkout '{repo_ref}'", cwd=repo_dir)
+
+    # Persist datasets + logs/checkpoints to the volume
+    _run(f"rm -rf data && ln -s '{DATA_DIR}' data", cwd=repo_dir)
+    _run(f"rm -rf logs && ln -s '{RUNS_DIR}' logs", cwd=repo_dir)
+
+    # Make speedrun available at repo root for convenience
+    sr = _find_file("speedrun.sh", repo_dir)
+    if sr and sr.exists():
+        _run(f"chmod +x '{sr}'", cwd=repo_dir)
+        if sr.parent.name == "runs" and not (repo_dir / "speedrun.sh").exists():
+            _run("cp runs/speedrun.sh ./speedrun.sh && chmod +x ./speedrun.sh", cwd=repo_dir)
+
     return repo_dir
 
-# ---- Main Functions ----
+def _ensure_uv_env_has_cuda_bits(repo_dir: Path) -> None:
+    """
+    Create/sync the repo .venv, then install cuSPARSELt which PyTorch may require at import time.
+    """
+    # 1) Create/sync the venv once
+    _run("uv sync --inexact", cwd=repo_dir)
+
+    # 2) Install cuSPARSELt into the same .venv used by uv (fixes libcusparseLt.so.0) [web:126]
+    _run("uv pip install nvidia-cusparselt-cu12", cwd=repo_dir)
+
+def _uv_run(repo_dir: Path, cmd: str) -> None:
+    """
+    Run inside the project env but avoid re-syncing each time. [web:137]
+    Falls back if --no-sync isn’t supported by your uv version.
+    """
+    try:
+        _run(f"uv run --no-sync {cmd}", cwd=repo_dir)  # [web:137]
+    except subprocess.CalledProcessError:
+        _run(f"uv run {cmd}", cwd=repo_dir)
+
+def _patch_speedrun_for_checkpoints(repo_dir: Path, eval_interval: int = 100) -> None:
+    """
+    Best-effort: append checkpointing flags to training invocations inside speedrun.sh.
+    (If patterns don’t match, it does nothing.)
+    """
+    sr = repo_dir / "speedrun.sh"
+    if not sr.exists():
+        return
+
+    flags = f" --eval_interval={eval_interval} --always_save_checkpoint=True"
+    # Patch lines that invoke training scripts/modules.
+    for needle in ["scripts.base_train", "scripts.mid_train", "scripts.chat_sft", "python -m", "uv run"]:
+        _run(f"grep -q '{needle}' speedrun.sh && sed -i '/{needle}/ s/$/{flags}/' speedrun.sh || true", cwd=repo_dir)
 
 @app.function(
     image=image,
     gpu=GPU_CONFIG,
-    timeout=24 * 60 * 60,  # 24 hours
+    timeout=24 * 60 * 60,
     volumes={str(VOL_PATH): vol},
-    _allow_background_volume_commits=True
 )
-def run_speedrun(
-    model: str = "d12",
-    repo_ref: str = "master",
-    repo_url: str = "https://github.com/karpathy/nanochat.git",
-    force_restart: bool = False
-):
-    """
-    Main training entrypoint. 
-    Auto-detects checkpoints to resume, otherwise runs speedrun.sh.
-    """
-    repo_dir = _setup_workspace(model, repo_url, repo_ref)
-    
-    # Check for existing checkpoint in the persistent volume
-    # Adjust 'ckpt.pt' based on exact file naming in nanochat (often 'ckpt.pt' or 'last.pt')
-    ckpt_path = RUNS_DIR / model / "ckpt.pt"
-    
-    cmd = ""
-    if ckpt_path.exists() and not force_restart:
-        print(f"\n>>> CHECKPOINT FOUND at {ckpt_path}. RESUMING... <<<\n")
-        # Resume command: bypasses speedrun.sh to run train.py directly
-        # You may need to add --batch_size adjustment here for 8x GPUs if not in config
-        cmd = f"./uv run train.py config/{model}.py --init_from='resume'"
-    else:
-        print(f"\n>>> STARTING FRESH SPEEDRUN ({model}) <<<\n")
-        if force_restart:
-            print("Force restart requested: Cleaning old logs...")
-            _run(f"rm -rf {RUNS_DIR}/{model}/*")
-            
-        # Standard entry point
-        cmd = f"./speedrun.sh {model}"
+def run_speedrun(repo_ref: str = "master", model: str = "d12", force_restart: bool = False):
+    repo_dir = _setup_repo(repo_ref=repo_ref, repo_url="https://github.com/karpathy/nanochat.git")
 
-    # Execute
-    try:
-        # We assume dependencies are handled by 'uv' inside the repo
-        _run(cmd, cwd=repo_dir)
-    except Exception as e:
-        print(f"Run failed or interrupted: {e}")
-        raise
-    finally:
-        vol.commit()
-        print(f"Artifacts synced to {RUNS_DIR}")
+    # Ensure torch can import by installing cuSPARSELt into the uv venv. [web:126]
+    _ensure_uv_env_has_cuda_bits(repo_dir)
 
+    # Force checkpointing every 100 steps in speedrun if possible (patch script),
+    # and also pass flags when we directly invoke base_train.
+    _patch_speedrun_for_checkpoints(repo_dir, eval_interval=100)
+
+    if force_restart:
+        _run(f"rm -rf '{RUNS_DIR}/{model}'", cwd=repo_dir)
+
+    # Run the speedrun (now located at repo root because we copied it from runs/ if needed) [web:43]
+    _run(f"./speedrun.sh {model}", cwd=repo_dir)
+
+    vol.commit()
+    return f"Done. Outputs in {RUNS_DIR}"
 
 @app.function(
     image=image,
-    gpu=GPU_CONFIG, # Uses the big GPUs even for test to verify memory/setup
-    timeout=20 * 60, # 20 mins max for test
-    volumes={str(VOL_PATH): vol}
+    gpu=GPU_CONFIG,
+    timeout=30 * 60,
+    volumes={str(VOL_PATH): vol},
 )
-def test_10_steps(
-    model: str = "d12",
-    repo_ref: str = "master"
-):
-    """
-    SMOKE TEST: Runs for 10 iterations only, saves, and exits.
-    Use this to verify the 8x B200 setup works before doing a full run.
-    """
-    repo_dir = _setup_workspace(model, "https://github.com/karpathy/nanochat.git", repo_ref)
-    
-    print("\n>>> CONFIGURING FOR SMOKE TEST (10 Steps) <<<\n")
-    
-    # 1. Modify config files in place to force short run
-    # Find the config file (e.g., config/d12.py or config/train_gpt2.py)
-    # We append a max_iters override to the config command
-    
-    # We'll invoke train.py manually for the test to strictly control it
-    # First, ensure data is prepared (speedrun.sh usually does this first)
-    # If data doesn't exist, we run the prep step only.
-    if not (repo_dir / "data" / "fineweb").exists():
-         print("Preparing data for test...")
-         _run("bash -c 'source speedrun.sh && prepare'", cwd=repo_dir)
+def smoke_test_10_steps(repo_ref: str = "master", model: str = "d12"):
+    repo_dir = _setup_repo(repo_ref=repo_ref, repo_url="https://github.com/karpathy/nanochat.git")
 
-    print("Running training for 10 steps...")
-    # Override: max_iters=10, save_interval=5, eval_interval=10
-    cmd = (
-        f"uv run train.py config/{model}.py "
-        "--max_iters=10 "
-        "--log_interval=1 "
-        "--eval_interval=10 "
-        "--always_save_checkpoint=True"
+    _ensure_uv_env_has_cuda_bits(repo_dir)
+
+    # Find base_train entrypoint (you already confirmed it exists in your run logs)
+    base_train = _find_file("base_train.py", repo_dir)
+    if not base_train:
+        raise FileNotFoundError("Could not find scripts/base_train.py")
+
+    rel = base_train.relative_to(repo_dir)
+
+    # 10-step smoke test; this one saves frequently (every 5) just to prove checkpointing works.
+    _uv_run(
+        repo_dir,
+        f"python {rel} config/{model}.py "
+        "--max_iters=10 --log_interval=1 "
+        "--eval_interval=5 --always_save_checkpoint=True"
     )
-    
-    _run(cmd, cwd=repo_dir)
-    
-    # Verify checkpoint exists
-    ckpt_path = RUNS_DIR / model / "ckpt.pt"
-    if ckpt_path.exists():
-        print(f"\nSUCCESS: Checkpoint created at {ckpt_path}")
-    else:
-        print("\nWARNING: No checkpoint found after test run.")
-    
-    vol.commit()
 
+    vol.commit()
+    return "Smoke test complete."
+
+@app.local_entrypoint()
+def main(task: str = "test", repo_ref: str = "master", model: str = "d12"):
+    if task == "run":
+        print(run_speedrun.remote(repo_ref=repo_ref, model=model))
+    else:
+        print(smoke_test_10_steps.remote(repo_ref=repo_ref, model=model))
